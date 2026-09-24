@@ -1,8 +1,10 @@
-from fastapi import FastAPI
+"""本地启动入口：uvicorn main:app --reload"""
 
-app = FastAPI()
+from __future__ import annotations
 
+from jobrunner.api import create_app
+from jobrunner.builtin_handlers import register_builtins
 
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+register_builtins()
+
+app = create_app()
