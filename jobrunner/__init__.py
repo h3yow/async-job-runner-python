@@ -5,6 +5,7 @@ from .errors import (
     InvalidStateTransition,
     JobNotFound,
     PermissionDenied,
+    QueueFull,
     QuotaExceeded,
 )
 from .models import ErrorCategory, Job, JobStatus
@@ -18,6 +19,7 @@ __all__ = [
     "JobNotFound",
     "PermissionDenied",
     "QuotaExceeded",
+    "QueueFull",
     "IdempotencyConflict",
     "InvalidStateTransition",
 ]

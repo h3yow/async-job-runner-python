@@ -19,6 +19,7 @@ from jobrunner.errors import (
     InvalidStateTransition,
     JobNotFound,
     PermissionDenied,
+    QueueFull,
     QuotaExceeded,
 )
 from jobrunner.handlers import register_handler
@@ -498,6 +499,75 @@ class TestHTTPAPI(unittest.TestCase):
         # 终态再取消：409
         rag = self.client.post(f"/jobs/{job_id}/cancel", headers=h)
         self.assertEqual(rag.status_code, 409)
+
+    def test_http_queue_wait_and_queue_full_and_cancel(self) -> None:
+        # 默认并发上限 1、默认队列容量：先占满并发，再验证 wait=true 的
+        # QUEUED 可见、队列满 429 QUEUE_FULL、等待中取消立即 CANCELLED。
+        h = {"X-Owner-Id": "quinn"}
+
+        def post(key: str, wait: bool, seconds: float = 0.6) -> tuple[int, dict]:
+            r = self.client.post(
+                "/jobs",
+                headers=h,
+                json={
+                    "handler": "sleep",
+                    "payload": {"seconds": seconds},
+                    "idempotency_key": key,
+                    "wait": wait,
+                },
+            )
+            return r.status_code, r.json()
+
+        code, runner = post("hq-0", wait=False)
+        self.assertEqual(code, 201, runner)
+        self.assertEqual(runner["status"], "RUNNING")
+
+        # 默认队列容量为 16，连续排 16 个
+        queued_ids: list[str] = []
+        for i in range(16):
+            c, body = post(f"hq-{i+1}", wait=True, seconds=0.05)
+            self.assertEqual(c, 201, body)
+            queued_ids.append(body["id"])
+        self.assertEqual(self.client.get(
+            f"/jobs/{queued_ids[0]}", headers=h
+        ).json()["status"], "QUEUED")
+        print("[http-queue] 16 个 wait 任务均以 QUEUED 可见")
+
+        # 队列已满：再排队 -> 429 QUEUE_FULL；直拒 -> 429 QUOTA_EXCEEDED
+        cf, body_f = post("hq-full", wait=True, seconds=0.05)
+        cq, body_q = post("hq-direct", wait=False)
+        print(
+            f"[http-queue] 队列满 -> {cf} {body_f['error']['code']}; "
+            f"直拒 -> {cq} {body_q['error']['code']}"
+        )
+        self.assertEqual(cf, 429)
+        self.assertEqual(body_f["error"]["code"], "QUEUE_FULL")
+        self.assertEqual(cq, 429)
+        self.assertEqual(body_q["error"]["code"], "QUOTA_EXCEEDED")
+
+        # 取消等待中的队首：立即 CANCELLED
+        rc = self.client.post(f"/jobs/{queued_ids[0]}/cancel", headers=h)
+        self.assertEqual(rc.status_code, 200)
+        self.assertEqual(rc.json()["status"], "CANCELLED")
+        print("[http-queue] 等待中取消立即返回 CANCELLED")
+        # 终态再取消：409
+        self.assertEqual(
+            self.client.post(f"/jobs/{queued_ids[0]}/cancel", headers=h).status_code,
+            409,
+        )
+
+        # 其余任务最终都成功（含占位任务），额度归零
+        deadline = time.monotonic() + 8
+        pending = {runner["id"], *queued_ids[1:]}
+        while time.monotonic() < deadline and pending:
+            for jid in list(pending):
+                g = self.client.get(f"/jobs/{jid}", headers=h).json()
+                if g["status"] in _TERM:
+                    self.assertEqual(g["status"], "SUCCEEDED", g)
+                    pending.discard(jid)
+            time.sleep(0.02)
+        self.assertFalse(pending, f"unfinished jobs: {pending}")
+        print("[http-queue] 占位与剩余排队任务全部 SUCCEEDED，队列清空")
 
 
 if __name__ == "__main__":

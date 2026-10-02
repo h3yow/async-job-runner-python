@@ -38,6 +38,13 @@ class QuotaExceeded(JobRunnerError):
     error_code = "QUOTA_EXCEEDED"
 
 
+class QueueFull(JobRunnerError):
+    """并发额度已满且等待队列也满；排队提交被拒绝，不占用任何额度/队列位。"""
+
+    http_status = 429
+    error_code = "QUEUE_FULL"
+
+
 class IdempotencyConflict(JobRunnerError):
     """相同幂等键但载荷不一致。"""
 

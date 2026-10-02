@@ -12,7 +12,8 @@ from typing import Any
 class JobStatus(str, enum.Enum):
     """任务状态枚举。终态：SUCCEEDED / FAILED / CANCELLED。"""
 
-    PENDING = "PENDING"        # 已提交，等待调度（可能在等待配额）
+    PENDING = "PENDING"        # 已提交，锁内瞬态（外部不可见）
+    QUEUED = "QUEUED"          # 排队等待额度，外部可见；不占并发额度
     RUNNING = "RUNNING"        # 已占用配额，正在执行
     SUCCEEDED = "SUCCEEDED"    # 终态：成功
     FAILED = "FAILED"          # 终态：失败（含超时）
@@ -25,7 +26,10 @@ TERMINAL_STATUSES = frozenset(
 
 # 合法状态流转（骨架：仅定义，不实现校验逻辑）
 ALLOWED_TRANSITIONS: dict[JobStatus, frozenset[JobStatus]] = {
-    JobStatus.PENDING: frozenset({JobStatus.RUNNING, JobStatus.CANCELLED}),
+    JobStatus.PENDING: frozenset(
+        {JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.CANCELLED}
+    ),
+    JobStatus.QUEUED: frozenset({JobStatus.RUNNING, JobStatus.CANCELLED}),
     JobStatus.RUNNING: frozenset(
         {JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED}
     ),
