@@ -1,14 +1,19 @@
-"""线程安全的内存任务存储（归属校验、幂等索引、配额计数与原子提交）。
+"""线程安全的内存任务存储（归属校验、幂等索引、配额计数、FIFO 队列与原子提交）。
 
 一致性约定：
-- 任务表、幂等索引、配额计数三类可变状态只在 self._lock 下读写。
+- 任务表、幂等索引、配额计数、等待队列四类可变状态只在 self._lock 下读写。
 - 提交（submit_job）在同一把锁内原子完成
-  「幂等查重 -> 配额检查 -> 计数+1 -> 任务以 RUNNING 落库 + 登记幂等键」：
-  任何一步不满足（键冲突 / 超额），任务不会被创建、计数不增加，
-  因此超额/冲突的提交不占用任何额度；竞态下也不可能实际并发超出上限。
-- 终结（finish_running）在同一把锁内原子完成「RUNNING→终态 + 计数-1」，
+  「幂等查重 -> 配额/队列检查 -> （计数+1 并以 RUNNING 落库 | 以 QUEUED 落库排队）
+  -> 登记幂等键」：任何一步不满足（键冲突 / 超额且不允许排队 / 队列满），
+  任务不会被创建、计数不增加、队列位置不占用，
+  因此被拒的提交不占用任何额度；竞态下也不可能实际并发超出上限。
+- 终结（finish_running）在同一把锁内原子完成
+  「RUNNING→终态 + 计数-1 + 按 FIFO 准入队首（QUEUED→RUNNING + 计数+1）」，
   配合 running_count(owner) == RUNNING 任务数 这条恒等式，
-  杜绝额度泄漏与重复释放。
+  杜绝额度泄漏、重复释放，以及「有空闲额度却压着等待任务不动」。
+- 排队取消（cancel_queued）在同一把锁内原子完成
+  「QUEUED→CANCELLED + 移出队列」，排队不占用额度，取消也不触碰计数；
+  被取消的等待任务永远不会被准入执行。
 - 锁外不暴露可变 Job：查询统一返回 snapshot() 字典，避免读撕裂。
 """
 
@@ -16,6 +21,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 from typing import Any
 
 from .errors import (
@@ -26,10 +32,15 @@ from .errors import (
 from .models import ALLOWED_TRANSITIONS, Job, JobStatus
 
 _DEFAULT_QUOTA = 1
+_DEFAULT_QUEUE_CAPACITY = 100
 
 
 class JobStore:
-    def __init__(self, default_quota: int = _DEFAULT_QUOTA) -> None:
+    def __init__(
+        self,
+        default_quota: int = _DEFAULT_QUOTA,
+        default_queue_capacity: int = _DEFAULT_QUEUE_CAPACITY,
+    ) -> None:
         self._lock = threading.RLock()
         self._jobs: dict[str, Job] = {}
         # (owner, key) -> job_id
@@ -38,6 +49,10 @@ class JobStore:
         self._running_count: dict[str, int] = {}
         self._quotas: dict[str, int] = {}
         self._default_quota = default_quota
+        # owner -> 等待中的任务 ID（FIFO，严格按提交先后，不许插队）
+        self._queues: dict[str, deque[str]] = {}
+        self._queue_caps: dict[str, int] = {}
+        self._default_queue_capacity = default_queue_capacity
 
     # ------------------------------------------------------------------ #
     # 配额
@@ -57,6 +72,23 @@ class JobStore:
             return self._running_count.get(owner, 0)
 
     # ------------------------------------------------------------------ #
+    # 排队容量
+    # ------------------------------------------------------------------ #
+    def set_queue_capacity(self, owner: str, capacity: int) -> None:
+        if capacity < 1:
+            raise ValueError("queue capacity must be >= 1")
+        with self._lock:
+            self._queue_caps[owner] = capacity
+
+    def get_queue_capacity(self, owner: str) -> int:
+        with self._lock:
+            return self._queue_caps.get(owner, self._default_queue_capacity)
+
+    def queued_count(self, owner: str) -> int:
+        with self._lock:
+            return len(self._queues.get(owner, ()))
+
+    # ------------------------------------------------------------------ #
     # 原子提交
     # ------------------------------------------------------------------ #
     def submit_job(
@@ -67,17 +99,22 @@ class JobStore:
         idem_key: str,
         payload: dict[str, Any],
         payload_hash: str,
+        timeout: float | None = None,
+        queue: bool = False,
     ) -> tuple[Job | None, str]:
         """原子提交。job_id 由调用方预生成（以便先注册取消事件）。
 
         返回 (job, verdict)：
 
-        - ("created", job) ：任务已创建并以 RUNNING 落库、配额已占用；
-        - ("replay",  job) ：命中同主体同幂等键且载荷哈希一致，返回原任务；
-        - ("conflict", None)：同键已存在但载荷不一致；
-        - ("quota",    None)：超出该主体并发上限，什么都没创建。
+        - ("created",   job) ：任务已创建并以 RUNNING 落库、配额已占用；
+        - ("queued",    job) ：queue=True 且并发已满，任务以 QUEUED 落库排队，
+                               不占用任何额度；
+        - ("replay",    job) ：命中同主体同幂等键且载荷哈希一致，返回原任务；
+        - ("conflict",  None)：同键已存在但载荷不一致；
+        - ("quota",     None)：queue=False 且超出并发上限，什么都没创建；
+        - ("queue_full",None)：queue=True 但排队容量已满，什么都没创建。
 
-        幂等判定先于配额判定：冲突/重放不涉及任何额度。
+        幂等判定先于配额/排队判定：冲突/重放不涉及任何额度与队列位置。
         """
         with self._lock:
             index_key = (owner, idem_key)
@@ -91,7 +128,26 @@ class JobStore:
             limit = self._quotas.get(owner, self._default_quota)
             used = self._running_count.get(owner, 0)
             if used >= limit:
-                return None, "quota"
+                if not queue:
+                    return None, "quota"
+                waiting = self._queues.setdefault(owner, deque())
+                cap = self._queue_caps.get(owner, self._default_queue_capacity)
+                if len(waiting) >= cap:
+                    # 队列满：拒绝，不创建任务、不占额度、不占队列位置
+                    return None, "queue_full"
+                job = Job(
+                    id=job_id,
+                    owner=owner,
+                    idempotency_key=idem_key,
+                    payload_hash=payload_hash,
+                    payload=payload,
+                    timeout=timeout,
+                    status=JobStatus.QUEUED,
+                )
+                self._jobs[job.id] = job
+                self._idem_index[index_key] = job.id
+                waiting.append(job.id)
+                return job, "queued"
 
             job = Job(
                 id=job_id,
@@ -99,6 +155,7 @@ class JobStore:
                 idempotency_key=idem_key,
                 payload_hash=payload_hash,
                 payload=payload,
+                timeout=timeout,
                 status=JobStatus.PENDING,  # 锁内瞬态，外部不可见
             )
             self._jobs[job.id] = job
@@ -108,6 +165,67 @@ class JobStore:
             job.status = JobStatus.RUNNING
             job.started_at = time.time()
             return job, "created"
+
+    # ------------------------------------------------------------------ #
+    # 排队准入与排队取消
+    # ------------------------------------------------------------------ #
+    def admit_ready(self, owner: str) -> list[Job]:
+        """把该主体队列头部的等待任务按 FIFO 准入为 RUNNING。
+
+        在同一把锁内完成「QUEUED→RUNNING + 计数+1 + started_at 起算」，
+        因此超时从真正开始执行时起算，等待时长不计入执行超时。
+        返回被准入的任务列表（调用方负责在锁外启动执行线程）。
+        不变式：准入后 running_count 仍 <= 上限；只要队列非空且有空闲
+        额度就必须准入，杜绝「有空闲额度却压着任务不动」。
+        """
+        admitted: list[Job] = []
+        with self._lock:
+            limit = self._quotas.get(owner, self._default_quota)
+            waiting = self._queues.get(owner)
+            if not waiting:
+                return admitted
+            used = self._running_count.get(owner, 0)
+            while waiting and used < limit:
+                job_id = waiting.popleft()
+                job = self._jobs[job_id]
+                if job.status is not JobStatus.QUEUED:
+                    # 防御：队列中不应出现非 QUEUED 项（取消时已同步移除）
+                    continue
+                job.status = JobStatus.RUNNING
+                job.started_at = time.time()
+                used += 1
+                self._running_count[owner] = used
+                admitted.append(job)
+        return admitted
+
+    def cancel_queued(self, job_id: str) -> Job:
+        """原子地「QUEUED→CANCELLED + 移出队列」。
+
+        排队任务不占用额度，取消也不触碰计数；取消后立刻退出等待、
+        永远不会被准入执行。任务不在 QUEUED（已准入/已终态）时抛
+        InvalidStateTransition，调用方据此走运行中取消或拒绝。
+        """
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise JobNotFound(f"job {job_id!r} not found", job_id=job_id)
+            if job.status is not JobStatus.QUEUED:
+                raise InvalidStateTransition(
+                    f"job {job_id!r} is not queued "
+                    f"(current={job.status.value})",
+                    job_id=job_id,
+                )
+            waiting = self._queues.get(job.owner)
+            if waiting is not None:
+                try:
+                    waiting.remove(job_id)
+                except ValueError:
+                    pass
+            job.status = JobStatus.CANCELLED
+            job.finished_at = time.time()
+            job.error_code = "CANCELLED"
+            job.error_message = "cancelled while queued"
+            return job
 
     # ------------------------------------------------------------------ #
     # CRUD
@@ -173,10 +291,15 @@ class JobStore:
 
     def finish_running(
         self, job_id: str, target: JobStatus, **fields: Any
-    ) -> Job:
-        """执行器专用：原子地「RUNNING→终态 + 释放一个配额」。
+    ) -> tuple[Job, list[Job]]:
+        """执行器专用：原子地「RUNNING→终态 + 释放一个配额 + 准入队首任务」。
 
-        任务已不在 RUNNING（重复回调/竞态终结）时不触碰计数并抛
+        返回 (已终结任务, 本次释放额度后新准入的 QUEUED→RUNNING 任务列表)。
+        终结与准入在同一把锁内完成：计数先 -1 再按 FIFO 补位，
+        任意瞬间 running_count 都不会超过上限，额度不泄漏也不重复释放；
+        只要队列里有等待任务且有空闲额度，补位必然发生。
+
+        任务已不在 RUNNING（重复回调/竞态终结）时不触碰计数、不做准入并抛
         InvalidStateTransition，调用方据此丢弃迟到结果——
         终态绝不回退、额度绝不重复释放。
         """
@@ -205,4 +328,5 @@ class JobStore:
             job.finished_at = time.time()
             for name, value in fields.items():
                 setattr(job, name, value)
-            return job
+            admitted = self.admit_ready(job.owner)
+            return job, admitted

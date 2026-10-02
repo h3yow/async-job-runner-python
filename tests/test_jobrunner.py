@@ -19,6 +19,7 @@ from jobrunner.errors import (
     InvalidStateTransition,
     JobNotFound,
     PermissionDenied,
+    QueueFull,
     QuotaExceeded,
 )
 from jobrunner.handlers import register_handler
@@ -71,6 +72,31 @@ def _counting_sleep(payload: dict, cancel_event: threading.Event) -> dict:
 
 
 register_handler("counting_sleep", _counting_sleep)
+
+
+# 记录「真正开始执行」先后顺序的处理器，用于验证 FIFO 准入不许插队
+_order_lock = threading.Lock()
+_start_order: list[str] = []
+
+
+def _recording_sleep(payload: dict, cancel_event: threading.Event) -> dict:
+    name = payload["name"]
+    with _order_lock:
+        _start_order.append(name)
+    deadline = time.monotonic() + payload.get("seconds", 0.1)
+    while True:
+        if cancel_event.is_set():
+            from jobrunner.handlers import TaskCancelled
+
+            raise TaskCancelled()
+        remain = deadline - time.monotonic()
+        if remain <= 0:
+            break
+        cancel_event.wait(min(0.02, remain))
+    return {"ran": name}
+
+
+register_handler("recording_sleep", _recording_sleep)
 
 
 class JobRunnerTestBase(unittest.TestCase):
@@ -409,6 +435,210 @@ class TestTimeoutAndErrors(JobRunnerTestBase):
         self.assertEqual(self.store.running_count("alice"), 0)
 
 
+class TestQueueing(JobRunnerTestBase):
+    """排队等待模式：queue=True 时并发占满不拒绝，而是 FIFO 排队等待准入。"""
+
+    def test_fifo_admission_order_no_overtake(self) -> None:
+        self.svc.set_quota("alice", 1)
+        blocker, _ = self.svc.submit(
+            "alice", "sleep", {"seconds": 0.3}, idempotency_key="blocker"
+        )
+        queued = []
+        for i in range(3):
+            job, _ = self.svc.submit(
+                "alice",
+                "recording_sleep",
+                {"name": f"q{i}", "seconds": 0.1},
+                idempotency_key=f"q{i}",
+                queue=True,
+            )
+            queued.append(job)
+        # 等待中的任务可查询、状态明确为 QUEUED，且不占运行额度
+        for j in queued:
+            snap = self.svc.get("alice", j.id)
+            self.assertEqual(snap["status"], JobStatus.QUEUED.value)
+        print(
+            f"[fifo] 输入: 上限=1, 1 个在跑 + 3 个排队(q0,q1,q2); "
+            f"提交时 running={self.store.running_count('alice')} "
+            f"queued={self.store.queued_count('alice')}"
+        )
+        self.assertEqual(self.store.running_count("alice"), 1)
+        self.assertEqual(self.store.queued_count("alice"), 3)
+
+        wait_terminal(self.svc, "alice", blocker.id)
+        for j in queued:
+            snap = wait_terminal(self.svc, "alice", j.id)
+            self.assertEqual(snap["status"], JobStatus.SUCCEEDED.value)
+        with _order_lock:
+            order = [n for n in _start_order if n.startswith("q")]
+        print(
+            f"[fifo] 判定依据: 实际执行先后顺序={order}，"
+            f"必须严格等于提交先后 [q0, q1, q2]，不许插队"
+        )
+        self.assertEqual(order, ["q0", "q1", "q2"])
+        self.assertEqual(self.store.running_count("alice"), 0)
+        self.assertEqual(self.store.queued_count("alice"), 0)
+
+    def test_cancel_queued_never_runs_and_consumes_nothing(self) -> None:
+        self.svc.set_quota("alice", 1)
+        running, _ = self.svc.submit(
+            "alice", "sleep", {"seconds": 0.4}, idempotency_key="run"
+        )
+        queued, _ = self.svc.submit(
+            "alice",
+            "counting_sleep",
+            {"name": "never-ran", "seconds": 0.1},
+            idempotency_key="q1",
+            queue=True,
+        )
+        self.assertEqual(
+            self.svc.get("alice", queued.id)["status"], JobStatus.QUEUED.value
+        )
+        snap = self.svc.cancel("alice", queued.id)
+        print(
+            f"[cancel-queued] 排队中取消: 返回状态={snap['status']} "
+            f"running={self.store.running_count('alice')} "
+            f"queued={self.store.queued_count('alice')}"
+        )
+        # 立即退出等待并落终态；排队本就不占额度，取消也不触碰计数
+        self.assertEqual(snap["status"], JobStatus.CANCELLED.value)
+        self.assertEqual(self.store.running_count("alice"), 1)
+        self.assertEqual(self.store.queued_count("alice"), 0)
+        wait_terminal(self.svc, "alice", running.id)
+        # 给准入/执行留出时间窗，确认被取消的排队任务永远没有被执行
+        time.sleep(0.3)
+        final = self.svc.get("alice", queued.id)
+        print(
+            f"[cancel-queued] 判定依据: final={final['status']} "
+            f"started_at={final['started_at']} "
+            f"处理器执行次数={_counter.get('never-ran', 0)}（必须为 0）"
+        )
+        self.assertEqual(final["status"], JobStatus.CANCELLED.value)
+        self.assertIsNone(final["started_at"])
+        self.assertEqual(_counter.get("never-ran", 0), 0)
+        self.assertEqual(self.store.running_count("alice"), 0)
+        # 已出最终结果的任务再取消，仍按老规则拒绝
+        with self.assertRaises(InvalidStateTransition):
+            self.svc.cancel("alice", queued.id)
+
+    def test_queue_full_rejected_without_consuming(self) -> None:
+        self.svc.set_quota("alice", 1)
+        self.svc.set_queue_capacity("alice", 1)
+        running, _ = self.svc.submit(
+            "alice", "sleep", {"seconds": 0.4}, idempotency_key="run"
+        )
+        q1, _ = self.svc.submit(
+            "alice", "sleep", {"seconds": 0.1}, idempotency_key="q1", queue=True
+        )
+        with self.assertRaises(QueueFull) as ctx:
+            self.svc.submit(
+                "alice", "echo", {}, idempotency_key="q2", queue=True
+            )
+        print(
+            f"[queue-full] 容量=1 且已有 1 个排队: 新排队提交被拒 "
+            f"code={ctx.exception.error_code}; msg={ctx.exception.message}"
+        )
+        self.assertEqual(ctx.exception.http_status, 429)
+        # 被拒的提交不创建任务、不占额度、不占队列位置
+        self.assertEqual(self.store.running_count("alice"), 1)
+        self.assertEqual(self.store.queued_count("alice"), 1)
+        self.assertEqual(len(self.svc.list_jobs("alice")), 2)
+        # 老行为保留：queue=False 超额依旧直接拒绝
+        with self.assertRaises(QuotaExceeded):
+            self.svc.submit("alice", "echo", {}, idempotency_key="q3")
+        print("[queue-full] 老行为判定: queue=False 超额仍抛 QUOTA_EXCEEDED")
+        wait_terminal(self.svc, "alice", running.id)
+        wait_terminal(self.svc, "alice", q1.id)
+        self.assertEqual(self.store.running_count("alice"), 0)
+
+    def test_queued_wait_time_not_counted_in_timeout(self) -> None:
+        self.svc.set_quota("alice", 1)
+        blocker, _ = self.svc.submit(
+            "alice", "sleep", {"seconds": 0.5}, idempotency_key="blocker"
+        )
+        # 排队等待 0.5s，远超自身 timeout=0.2s；若等待计入超时必失败
+        queued, _ = self.svc.submit(
+            "alice",
+            "sleep",
+            {"seconds": 0.2},
+            idempotency_key="q-timeout",
+            timeout=0.4,
+            queue=True,
+        )
+        self.assertEqual(
+            self.svc.get("alice", queued.id)["status"], JobStatus.QUEUED.value
+        )
+        wait_terminal(self.svc, "alice", blocker.id)
+        final = wait_terminal(self.svc, "alice", queued.id, timeout=3.0)
+        waited = final["started_at"] - final["created_at"]
+        print(
+            f"[queued-timeout] 输入: 排队等待={waited:.2f}s, timeout=0.4s; "
+            f"判定依据: status={final['status']}（超时须从 RUNNING 起算，"
+            f"等待时长不计入，故应 SUCCEEDED）"
+        )
+        self.assertEqual(final["status"], JobStatus.SUCCEEDED.value)
+        self.assertGreater(waited, 0.3, "确实经历了排队等待")
+
+    def test_peak_concurrency_with_timeout_cancel_and_admission(self) -> None:
+        limit = 2
+        self.svc.set_quota("dave", limit)
+        self.svc.set_queue_capacity("dave", 16)
+        max_seen = 0
+        stop = threading.Event()
+        lock = threading.Lock()
+
+        def monitor() -> None:
+            nonlocal max_seen
+            while not stop.is_set():
+                used = self.store.running_count("dave")
+                with lock:
+                    max_seen = max(max_seen, used)
+                time.sleep(0.001)
+
+        mon = threading.Thread(target=monitor)
+        mon.start()
+        # 一个必超时（timeout=0.2 但需睡 5s），一个将被取消
+        t_job, _ = self.svc.submit(
+            "dave", "sleep", {"seconds": 5}, idempotency_key="t", timeout=0.2
+        )
+        c_job, _ = self.svc.submit(
+            "dave", "sleep", {"seconds": 5}, idempotency_key="c"
+        )
+        queued_ids = []
+        for i in range(6):
+            job, _ = self.svc.submit(
+                "dave",
+                "sleep",
+                {"seconds": 0.1},
+                idempotency_key=f"q{i}",
+                queue=True,
+            )
+            queued_ids.append(job.id)
+        self.assertEqual(self.store.queued_count("dave"), 6)
+        # 取消一个运行中任务：与超时释放、准入补位密集交叠
+        self.svc.cancel("dave", c_job.id)
+        finals = [wait_terminal(self.svc, "dave", jid) for jid in queued_ids]
+        tf = wait_terminal(self.svc, "dave", t_job.id)
+        cf = wait_terminal(self.svc, "dave", c_job.id)
+        stop.set()
+        mon.join()
+        statuses = [f["status"] for f in finals]
+        print(
+            f"[peak] 输入: 上限={limit}, 1 超时 + 1 取消 + 6 排队; "
+            f"观测峰值并发={max_seen}, 排队任务终态={statuses}, "
+            f"超时任务={tf['status']}/{tf['error_category']}, "
+            f"取消任务={cf['status']}"
+        )
+        self.assertLessEqual(max_seen, limit, "并发峰值绝不能超过上限")
+        self.assertEqual(tf["status"], JobStatus.FAILED.value)
+        self.assertEqual(tf["error_category"], "TIMEOUT")
+        self.assertEqual(cf["status"], JobStatus.CANCELLED.value)
+        # 额度腾出后排队任务必须全部起来并成功，不许压着不动
+        self.assertEqual(statuses, [JobStatus.SUCCEEDED.value] * 6)
+        self.assertEqual(self.store.running_count("dave"), 0)
+        self.assertEqual(self.store.queued_count("dave"), 0)
+
+
 class TestHTTPAPI(unittest.TestCase):
     """通过 ASGI 测试客户端验证 HTTP 语义（404/403/409/429 可区分）。"""
 
@@ -498,6 +728,64 @@ class TestHTTPAPI(unittest.TestCase):
         # 终态再取消：409
         rag = self.client.post(f"/jobs/{job_id}/cancel", headers=h)
         self.assertEqual(rag.status_code, 409)
+
+    def test_http_queue_mode(self) -> None:
+        h = {"X-Owner-Id": "alice"}
+        self.svc.set_queue_capacity("alice", 1)
+        # 默认配额 1：第一个直接运行
+        r1 = self.client.post(
+            "/jobs",
+            headers=h,
+            json={
+                "handler": "sleep",
+                "payload": {"seconds": 0.4},
+                "idempotency_key": "hq-1",
+            },
+        )
+        self.assertEqual(r1.status_code, 201, r1.text)
+        # queue=true：占满后进入 QUEUED 而不是 429
+        r2 = self.client.post(
+            "/jobs",
+            headers=h,
+            json={
+                "handler": "sleep",
+                "payload": {"seconds": 0.1},
+                "idempotency_key": "hq-2",
+                "queue": True,
+            },
+        )
+        self.assertEqual(r2.status_code, 201, r2.text)
+        queued_id = r2.json()["id"]
+        g = self.client.get(f"/jobs/{queued_id}", headers=h).json()
+        print(f"[http-queue] queue=true 提交后状态={g['status']}（应为 QUEUED）")
+        self.assertEqual(g["status"], "QUEUED")
+        # 队列容量=1 已满：再排队 -> 429 QUEUE_FULL
+        r3 = self.client.post(
+            "/jobs",
+            headers=h,
+            json={"handler": "echo", "payload": {}, "idempotency_key": "hq-3",
+                  "queue": True},
+        )
+        print(
+            f"[http-queue] 队列满 -> {r3.status_code} "
+            f"{r3.json()['error']['code']}"
+        )
+        self.assertEqual(r3.status_code, 429)
+        self.assertEqual(r3.json()["error"]["code"], "QUEUE_FULL")
+        # 等待中的任务可取消，立即落 CANCELLED
+        rc = self.client.post(f"/jobs/{queued_id}/cancel", headers=h)
+        self.assertEqual(rc.status_code, 200)
+        self.assertEqual(rc.json()["status"], "CANCELLED")
+        print(f"[http-queue] 排队取消 -> {rc.json()['status']}")
+        # 第一个任务正常结束
+        deadline = time.monotonic() + 3
+        first_id = r1.json()["id"]
+        while time.monotonic() < deadline:
+            g1 = self.client.get(f"/jobs/{first_id}", headers=h).json()
+            if g1["status"] in _TERM:
+                break
+            time.sleep(0.02)
+        self.assertEqual(g1["status"], "SUCCEEDED")
 
 
 if __name__ == "__main__":

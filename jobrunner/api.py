@@ -9,7 +9,8 @@
 - 越权访问他人任务    403 PERMISSION_DENIED
 - 幂等载荷冲突        409 IDEMPOTENCY_CONFLICT
 - 终态非法操作        409 INVALID_STATE_TRANSITION
-- 超出并发配额        429 QUOTA_EXCEEDED
+- 超出并发配额        429 QUOTA_EXCEEDED（queue=false 时的老行为）
+- 排队容量已满        429 QUEUE_FULL（queue=true 且队列满）
 - 参数/处理器不合法   422 INVALID_REQUEST
 """
 
@@ -29,6 +30,8 @@ class SubmitRequest(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     idempotency_key: str = Field(min_length=1)
     timeout: float | None = Field(default=None, gt=0)
+    # true：并发占满时进入 QUEUED 排队等待；false（默认）：超额直接 429
+    queue: bool = False
 
 
 def _require_owner(x_owner_id: str | None) -> str:
@@ -71,6 +74,7 @@ def create_app(service: JobService | None = None) -> FastAPI:
             body.payload,
             idempotency_key=body.idempotency_key,
             timeout=body.timeout,
+            queue=body.queue,
         )
         snap = job.snapshot()
         snap["idempotent_replay"] = replayed

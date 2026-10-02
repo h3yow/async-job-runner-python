@@ -12,7 +12,8 @@ from typing import Any
 class JobStatus(str, enum.Enum):
     """任务状态枚举。终态：SUCCEEDED / FAILED / CANCELLED。"""
 
-    PENDING = "PENDING"        # 已提交，等待调度（可能在等待配额）
+    PENDING = "PENDING"        # 已提交，等待调度（提交锁内瞬态，外部不可见）
+    QUEUED = "QUEUED"          # 排队等待配额（可查询、可取消，不占额度）
     RUNNING = "RUNNING"        # 已占用配额，正在执行
     SUCCEEDED = "SUCCEEDED"    # 终态：成功
     FAILED = "FAILED"          # 终态：失败（含超时）
@@ -26,6 +27,7 @@ TERMINAL_STATUSES = frozenset(
 # 合法状态流转（骨架：仅定义，不实现校验逻辑）
 ALLOWED_TRANSITIONS: dict[JobStatus, frozenset[JobStatus]] = {
     JobStatus.PENDING: frozenset({JobStatus.RUNNING, JobStatus.CANCELLED}),
+    JobStatus.QUEUED: frozenset({JobStatus.RUNNING, JobStatus.CANCELLED}),
     JobStatus.RUNNING: frozenset(
         {JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED}
     ),
@@ -52,6 +54,7 @@ class Job:
     idempotency_key: str
     payload_hash: str
     payload: dict[str, Any]
+    timeout: float | None = None   # 执行超时；从真正开始执行（准入 RUNNING）时起算
     status: JobStatus = JobStatus.PENDING
     result: Any = None
     error_category: ErrorCategory | None = None
@@ -77,6 +80,7 @@ class Job:
             "idempotency_key": self.idempotency_key,
             "payload_hash": self.payload_hash,
             "payload": dict(self.payload),
+            "timeout": self.timeout,
             "status": self.status.value,
             "result": self.result,
             "error_category": (

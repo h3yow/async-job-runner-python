@@ -18,10 +18,11 @@ from .errors import (
     IdempotencyConflict,
     InvalidRequest,
     InvalidStateTransition,
+    QueueFull,
     QuotaExceeded,
 )
 from .handlers import get_handler
-from .models import Job
+from .models import Job, JobStatus
 from .store import JobStore
 
 
@@ -58,6 +59,14 @@ class JobService:
 
     def set_quota(self, owner: str, limit: int) -> None:
         self._store.set_quota(owner, limit)
+        # 提额后若队列里有等待任务，必须立即按 FIFO 补位，
+        # 不允许「已有空闲额度、队列里却压着任务不动」。
+        admitted = self._store.admit_ready(owner)
+        if admitted:
+            self._executor.launch_admitted(admitted)
+
+    def set_queue_capacity(self, owner: str, capacity: int) -> None:
+        self._store.set_queue_capacity(owner, capacity)
 
     def submit(
         self,
@@ -67,12 +76,17 @@ class JobService:
         *,
         idempotency_key: str,
         timeout: float | None = None,
+        queue: bool = False,
     ) -> tuple[Job, bool]:
         """提交任务，返回 (job, replayed)。
 
         - 相同 (owner, idempotency_key) 且载荷一致：返回同一个任务，只执行一次；
         - 相同键但载荷不一致：抛 IdempotencyConflict（409）并说明差异；
-        - 超出主体并发上限：抛 QuotaExceeded（429），不创建任务、不占额度。
+        - queue=False（默认，老行为）：超出主体并发上限抛 QuotaExceeded（429），
+          不创建任务、不占额度；
+        - queue=True：并发已满时任务以 QUEUED 落库排队（可查询、可取消，
+          不占额度），额度腾出后按提交先后自动准入执行；
+          排队容量也已满时抛 QueueFull（429），同样不创建任务、不占额度。
         """
         arguments = dict(payload or {})
         if not isinstance(idempotency_key, str) or not idempotency_key:
@@ -94,6 +108,8 @@ class JobService:
                 idem_key=idempotency_key,
                 payload=stored_payload,
                 payload_hash=payload_hash,
+                timeout=timeout,
+                queue=queue,
             )
         except BaseException:
             self._executor.discard_event(job_id)
@@ -121,6 +137,19 @@ class JobService:
                 f"(running={self._store.running_count(owner)}); "
                 "request rejected without consuming any quota"
             )
+        if verdict == "queue_full":
+            self._executor.discard_event(job_id)
+            raise QueueFull(
+                f"principal {owner!r} queue is full "
+                f"(capacity={self._store.get_queue_capacity(owner)}, "
+                f"queued={self._store.queued_count(owner)}); "
+                "request rejected without consuming any quota or queue slot"
+            )
+        if verdict == "queued":
+            # 排队任务：保留预注册的取消事件（取消/准入都要用），
+            # 不启动线程、不占额度；额度腾出后由终结路径自动准入。
+            assert job is not None
+            return job, False
 
         assert verdict == "created" and job is not None
         self._executor.launch(job, timeout, event)
@@ -137,6 +166,8 @@ class JobService:
 
         - 不存在 -> JobNotFound(404)；他人任务 -> PermissionDenied(403)；
         - 终态任务不可取消 -> InvalidStateTransition(409)，终态保持不变；
+        - 排队中（QUEUED）：原子地退出等待并落 CANCELLED，永不执行、
+          不占用也不释放任何额度，等待时长不计入执行超时；
         - 运行中：置位取消信号，处理器在检查点停止后落 CANCELLED。
           调用方可随后 get() 轮询确认终态。
         """
@@ -146,6 +177,16 @@ class JobService:
                 f"job {job_id!r} already in terminal state {job.status.value}",
                 job_id=job_id,
             )
+        if job.status is JobStatus.QUEUED:
+            try:
+                self._store.cancel_queued(job_id)
+            except InvalidStateTransition:
+                # 竞态：取消瞬间恰好被准入为 RUNNING，改走运行中取消
+                self._executor.request_cancel(job_id)
+            else:
+                # 排队取消成功：回收预注册的取消事件（任务永不执行）
+                self._executor.discard_event(job_id)
+            return self._store.get_owned(job_id, owner).snapshot()
         self._executor.request_cancel(job_id)
         return self._store.get_owned(job_id, owner).snapshot()
 

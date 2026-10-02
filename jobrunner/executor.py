@@ -76,6 +76,27 @@ class JobExecutor:
             self._handler_threads.add(thread)
         thread.start()
 
+    def launch_admitted(self, jobs: list[Job]) -> None:
+        """为准准入的排队任务启动执行线程。
+
+        取消事件在提交时已预注册并一直保留，这里按 job_id 取回；
+        超时使用任务创建时保存的 timeout，从准入（RUNNING）时刻起算。
+        """
+        for job in jobs:
+            with self._lock:
+                event = self._cancel_events.get(job.id)
+            if event is None:
+                # 事件缺失属于系统缺陷：终结为失败并释放刚占用的配额
+                self._finish_failure(
+                    job.id,
+                    ErrorCategory.SYSTEM,
+                    "MISSING_CANCEL_EVENT",
+                    "cancel event missing for admitted job",
+                    event=threading.Event(),
+                )
+                continue
+            self.launch(job, job.timeout, event)
+
     def request_cancel(self, job_id: str) -> bool:
         """置位取消信号，可重复调用；事件已不存在（任务已终结）返回 False。"""
         with self._lock:
@@ -199,16 +220,21 @@ class JobExecutor:
         self._finish_success(job_id, outcome_box.get("result"), event=event)
 
     # ------------------------------------------------------------------ #
-    # 终态提交（全部走 store 的原子转换；终态不可回退、不重复执行）
+    # 终态提交（全部走 store 的原子转换；终态不可回退、不重复执行。
+    # 每次终结都会带回新准入的排队任务，由执行器立即启动，保证
+    # 「额度一腾出、队首就开工」，且同时在跑的任务数绝不超过上限。）
     # ------------------------------------------------------------------ #
     def _finish_success(
         self, job_id: str, result: Any, *, event: threading.Event
     ) -> None:
         try:
-            self._store.finish_running(job_id, JobStatus.SUCCEEDED, result=result)
+            _, admitted = self._store.finish_running(
+                job_id, JobStatus.SUCCEEDED, result=result
+            )
         except Exception:
             # 已被终结（重复回调/竞态）：放弃结果，禁止回退
-            pass
+            return
+        self.launch_admitted(admitted)
 
     def _finish_failure(
         self,
@@ -220,7 +246,7 @@ class JobExecutor:
         event: threading.Event,
     ) -> None:
         try:
-            self._store.finish_running(
+            _, admitted = self._store.finish_running(
                 job_id,
                 JobStatus.FAILED,
                 error_category=category,
@@ -228,17 +254,19 @@ class JobExecutor:
                 error_message=message,
             )
         except Exception:
-            pass
+            return
+        self.launch_admitted(admitted)
 
     def _finish_cancelled(
         self, job_id: str, message: str, *, event: threading.Event
     ) -> None:
         try:
-            self._store.finish_running(
+            _, admitted = self._store.finish_running(
                 job_id,
                 JobStatus.CANCELLED,
                 error_code="CANCELLED",
                 error_message=message,
             )
         except Exception:
-            pass
+            return
+        self.launch_admitted(admitted)
